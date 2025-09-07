@@ -36,12 +36,20 @@ fn badrequest_error<E: std::fmt::Display>(err: E) -> ApiError {
 struct AppState {
     scripts: DashMap<Uuid, String>,
     script_sender: std::sync::mpsc::Sender<(String, tokio::sync::oneshot::Sender<String>)>,
-    script_scheduler: tokio::sync::mpsc::Sender<Script>
+    script_scheduler: tokio::sync::mpsc::Sender<CronScript>
 }
 
 
-struct Script {
+
+
+struct CronScript {
     cron: Schedule,
+    script: String
+}
+
+#[derive(Object)]
+struct ScriptRequest {
+    cron: Option<String>,
     script: String
 }
 
@@ -51,6 +59,11 @@ struct ScriptResponse {
     script: String
 }
 
+#[derive(Object)]
+struct ScriptPostResponse {
+    id: Uuid,
+    script: ScriptRequest
+}
 
 async fn run_script(script: String, script_sender: &Sender<(String, tokio::sync::oneshot::Sender<String>)>) -> Result<String, Box<dyn Error>> {
     let (res_sender, res_reciever) = tokio::sync::oneshot::channel::<String>();
@@ -64,15 +77,6 @@ struct Api;
 
 #[OpenApi]
 impl Api {
-
-
-    #[oai(path = "/hello", method = "get")]
-    async fn index(&self, name: Query<Option<String>>) -> PlainText<String> {
-        match name.0 {
-            Some(name) => PlainText(format!("hello, {}!", name)),
-            None => PlainText("hello!".to_string()),
-        }
-    }
 
     #[oai(path = "/run-script", method = "get")]
     async fn run_script(&self, state: web::Data<&Arc<AppState>>, uuid: Query<Uuid>) -> Result<PlainText<String>, ApiError> {
@@ -98,18 +102,30 @@ impl Api {
     }
 
     #[oai(path = "/script", method = "post")]
-    async fn script_post(&self, state: web::Data<&Arc<AppState>>, payload: PlainText<String>) -> Result<Json<ScriptResponse>, ApiError> {
+    async fn script_post(&self, state: web::Data<&Arc<AppState>>, payload: Json<ScriptRequest>) -> Result<Json<ScriptPostResponse>, ApiError> {
         {
             let engine = Engine::new() ;
-            let _ = engine.compile(&payload.0).map_err(badrequest_error)?;
+            let _ = engine.compile(&payload.script).map_err(badrequest_error)?;
         }
         let id = Uuid::new_v4();
-        let _ = state.scripts.insert(id, payload.0.clone());
-        let cron = Schedule::from_str("*/5 * * * * *").map_err(badrequest_error)?;
-        state.script_scheduler.send(Script { cron: cron, script: payload.0.clone() }).await.map_err(interal_error)?;
-        return Ok(Json(ScriptResponse {
+        let _ = state.scripts.insert(id, payload.script.clone());
+        let cron = payload.cron.as_ref().map(|s| {Schedule::from_str(s).map_err(badrequest_error)});
+        if let Some(cron) = cron {
+            let script = cron.map(|c| {
+                            CronScript {
+                                cron: c,
+                                script: payload.script.clone()
+                            }
+                        })?;
+            state.script_scheduler.send(script).await.map_err(interal_error)?;
+
+        }
+        return Ok(Json(ScriptPostResponse {
             id: id,
-            script: payload.0
+            script: ScriptRequest {
+                script: payload.script.clone(),
+                cron: payload.cron.clone()
+            }
         }));
        
     }
@@ -146,7 +162,7 @@ async fn main() -> Result<(), std::io::Error> {
         sched.start().await.expect("NANNNNNNNNIIIIII");
         while let Some(script) = scheduler_reciever.recv().await {
             let schedulers_state_cloned = schedulers_state.clone();
-            let script_clone = Script {
+            let script_clone = CronScript {
                 cron: script.cron.clone(),
                 script: script.script.clone(),
             };
@@ -188,8 +204,6 @@ async fn main() -> Result<(), std::io::Error> {
                     .server("http://localhost:3000/api")
                     .server("https://rhai-runner-27790705784.europe-north2.run.app/api");
     let ui = api_service.scalar();
-    let spec = api_service.spec();
-    fs::write("openapi.json", spec).await.expect("Unable to write file");
     let app = Route::new()
                                                     .nest("/api", api_service)
                                                     .nest("/", ui)

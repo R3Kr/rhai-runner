@@ -1,9 +1,14 @@
-use std::{collections::HashMap, error::Error, ops::Index, os::unix::ffi::OsStringExt, str::FromStr, sync::{mpsc::{self, Receiver}, Arc, Mutex, RwLock}, thread};
+use std::{collections::HashMap, error::Error, ops::Index, os::unix::ffi::OsStringExt, str::FromStr, sync::{mpsc::{self, Receiver, Sender}, Arc, Mutex, RwLock}, thread};
 
 use poem::{error, get, http::{request, Uri}, listener::TcpListener, middleware::AddData, web, EndpointExt, Request, Route};
-use poem_openapi::{param::Query, payload::PlainText, OpenApi, OpenApiService, ApiResponse};
+use poem_openapi::{param::Query, payload::{Json, PlainText}, ApiResponse, Object, OpenApi, OpenApiService};
 use rhai::{Dynamic, Engine, EvalAltResult, AST};
-use tokio::fs;
+use serde::Serialize;
+use tokio::{fs};
+use dashmap::DashMap;
+use uuid::Uuid;
+use tokio_cron_scheduler::{job, Job, JobScheduler, JobSchedulerError};
+use cron::Schedule;
 
 #[derive(ApiResponse)]
 enum ApiError {
@@ -29,33 +34,30 @@ fn badrequest_error<E: std::fmt::Display>(err: E) -> ApiError {
     return ApiError::RequestError(PlainText(err.to_string()))
 }
 struct AppState {
-    scripts: RwLock<Vec<String>>,
-    script_sender: std::sync::mpsc::Sender<(String, tokio::sync::oneshot::Sender<String>)>
+    scripts: DashMap<Uuid, String>,
+    script_sender: std::sync::mpsc::Sender<(String, tokio::sync::oneshot::Sender<String>)>,
+    script_scheduler: tokio::sync::mpsc::Sender<Script>
 }
 
-async fn fetch_factory() -> impl Fn(&str) -> Dynamic {
-    let (url_sender, mut url_reciever) = tokio::sync::mpsc::channel::<String>(1000);
-    let (response_sender,response_reciever) = mpsc::channel::<String>();
 
-    let handle = tokio::spawn(async move {
-        let client = reqwest::Client::new();
-        while let Some(url) = url_reciever.recv().await {
-            let resp = client.get(url).send().await.unwrap();
-            let text = resp.text().await.unwrap();
-            response_sender.send(text);
-        }
-    });
+struct Script {
+    cron: Schedule,
+    script: String
+}
+
+#[derive(Object)]
+struct ScriptResponse {
+    id: Uuid,
+    script: String
+}
 
 
-    return move |str| {
+async fn run_script(script: String, script_sender: &Sender<(String, tokio::sync::oneshot::Sender<String>)>) -> Result<String, Box<dyn Error>> {
+    let (res_sender, res_reciever) = tokio::sync::oneshot::channel::<String>();
+    script_sender.send((script, res_sender))?;
 
-        let _ = url_sender.try_send(str.to_string());
-        thread::yield_now();
-        match response_reciever.recv() {
-            Ok(x) => x.into(),
-            Err(e) => panic!("Failed to receive response: {}", e),
-        }
-    };
+    let res = res_reciever.await?;
+    return Ok(res);
 }
 
 struct Api; 
@@ -73,49 +75,52 @@ impl Api {
     }
 
     #[oai(path = "/run-script", method = "get")]
-    async fn run_script(&self, state: web::Data<&Arc<AppState>>, idx: Query<usize>) -> Result<PlainText<String>, ApiError> {
-        let fetch = fetch_factory().await;
+    async fn run_script(&self, state: web::Data<&Arc<AppState>>, uuid: Query<Uuid>) -> Result<PlainText<String>, ApiError> {
         let script: String;
         {
-
-            let vector = state.scripts.read().map_err(interal_error)?;
-            let index = idx.abs_diff(0);
-            let s = &vector.get(index).ok_or_else(|| {notfound_error(format!("Script not found at index: {}", index))})?;
-            script = s.to_string();
+            let kv = state.scripts.get(&uuid).ok_or(notfound_error(format!("Script id {} not found", uuid.0)))?;
+            script = kv.value().to_owned()
         }
 
-        let (res_sender, res_reciever) = tokio::sync::oneshot::channel::<String>();
-        state.script_sender.send((script, res_sender)).expect("surely this doesnt error");
-
-        let res = res_reciever.await.map_err(interal_error)?;
+        let res = run_script(script, &state.script_sender).await.map_err(interal_error)?;
         return Ok(PlainText(res));
     }
 
     #[oai(path = "/scripts", method = "get")]
-    async fn scripts(&self, state: web::Data<&Arc<AppState>>) -> Result<PlainText<String>, ApiError> {
-        let mut i = 0;
-        let vec  = state.scripts.read()
-                                    .map_err(interal_error)?
-                                    .iter().map(|s| {
-                                        i += 1;
-                                        return format!("Script {}: {}", i - 1, s)
+    async fn scripts(&self, state: web::Data<&Arc<AppState>>) -> Result<Json<Vec<ScriptResponse>>, ApiError> {
+        let vec  = state.scripts.iter()
+                                    .map(|kv| {
+                                        return ScriptResponse { id: *kv.key(), script: kv.value().to_string() }
                                     })
-                                    .collect::<Vec<String>>();
+                                    .collect::<Vec<ScriptResponse>>();
                                                             
-        let res = vec.join("\n-----------------------------------------------------------------------\n");
-        
-        return Ok(PlainText(res))
+        return Ok(Json(vec))
     }
 
     #[oai(path = "/script", method = "post")]
-    async fn script_post(&self, state: web::Data<&Arc<AppState>>, payload: PlainText<String>) -> Result<PlainText<String>, ApiError> {
-        let engine = Engine::new() ;
-        let _ = engine.compile(&payload.0).map_err(badrequest_error)?;
-        let mut vec = state.scripts.write().map_err(interal_error)?;
-        vec.push(payload.0);
-        let size = vec.len();
-        return Ok(PlainText(format!("Index of script: {}", size - 1)));
+    async fn script_post(&self, state: web::Data<&Arc<AppState>>, payload: PlainText<String>) -> Result<Json<ScriptResponse>, ApiError> {
+        {
+            let engine = Engine::new() ;
+            let _ = engine.compile(&payload.0).map_err(badrequest_error)?;
+        }
+        let id = Uuid::new_v4();
+        let _ = state.scripts.insert(id, payload.0.clone());
+        let cron = Schedule::from_str("*/5 * * * * *").map_err(badrequest_error)?;
+        state.script_scheduler.send(Script { cron: cron, script: payload.0.clone() }).await.map_err(interal_error)?;
+        return Ok(Json(ScriptResponse {
+            id: id,
+            script: payload.0
+        }));
        
+    }
+
+    #[oai(path = "/script", method = "delete")]
+    async fn script_delete(&self, state: web::Data<&Arc<AppState>>, uuid: Query<Uuid>) -> Result<Json<ScriptResponse>, ApiError> {
+        let removed = state.scripts.remove(&uuid).ok_or_else(|| notfound_error(format!("Script not found: {}", uuid.0)))?;
+        return Ok(Json(ScriptResponse {
+            id: removed.0,
+            script: removed.1
+        }));
     }
 }
 
@@ -129,10 +134,40 @@ fn fetch(url: &str) -> Dynamic {
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
     let (script_sender, script_reciever) =  mpsc::channel::<(String, tokio::sync::oneshot::Sender<String>)>();
+    let (scheduler_sender, mut scheduler_reciever) = tokio::sync::mpsc::channel(500);
     let state = Arc::new(AppState{
-        scripts: RwLock::new(vec![]),
-        script_sender: script_sender
+        scripts: DashMap::new(),
+        script_sender: script_sender,
+        script_scheduler: scheduler_sender
     });
+    let schedulers_state = state.clone();
+    tokio::spawn(async move {
+        let sched = JobScheduler::new().await.expect("Nani????");
+        sched.start().await.expect("NANNNNNNNNIIIIII");
+        while let Some(script) = scheduler_reciever.recv().await {
+            let schedulers_state_cloned = schedulers_state.clone();
+            let script_clone = Script {
+                cron: script.cron.clone(),
+                script: script.script.clone(),
+            };
+            let job_res = Job::new_async(script_clone.cron, move |_uuid, _l| {
+                println!("Job id: {}", _uuid);
+                let schedulers_state = schedulers_state_cloned.clone();
+                let script_inner = script_clone.script.clone();
+                return Box::pin(async move {
+                    let _ = run_script(script_inner, &schedulers_state.script_sender).await;
+                })
+            });
+            match job_res {
+                Ok(job) => {
+                    if let Err(e) = sched.add(job).await {
+                        eprintln!("Scheduling error: {}", e);
+                    }
+                },
+                Err(e) => eprintln!("Scheduling error: {}", e)
+            }
+
+    }});
 
     let handle = rayon::spawn(move || {
 
@@ -149,8 +184,10 @@ async fn main() -> Result<(), std::io::Error> {
     });
 
     let api_service =
-        OpenApiService::new(Api, "Hello World", "1.0").server("http://localhost:3000/api");
-    let ui = api_service.swagger_ui();
+        OpenApiService::new(Api, "Hello World", "1.0")
+                    .server("http://localhost:3000/api")
+                    .server("https://rhai-runner-27790705784.europe-north2.run.app/api");
+    let ui = api_service.scalar();
     let spec = api_service.spec();
     fs::write("openapi.json", spec).await.expect("Unable to write file");
     let app = Route::new()
@@ -158,7 +195,6 @@ async fn main() -> Result<(), std::io::Error> {
                                                     .nest("/", ui)
                                                     // .at("/openapi.json", get(|| async move { spec.clone() }))
                                                     .with(AddData::new(state));
-
     poem::Server::new(TcpListener::bind("0.0.0.0:3000"))
         .run(app)
         .await

@@ -6,7 +6,12 @@ edition = "2024"
 [dependencies]
 tokio = { version="1.47.1", features=["full"]}
 poem = "3"
-poem-openapi = { version = "5", features = ["swagger-ui"]}
+poem-openapi = { version = "5", features = ["swagger-ui", "uuid", "scalar", "rapidoc", "redoc"]}
 rhai = "1.22.2"
 reqwest = { version = "0.12.23", features = ["json", "blocking"] }
 rayon = "1.11.0"
+dashmap = "6.1.0"
+uuid = {version = "1.18.1", features =  ["v4", "fast-rng", "serde"] }
+serde = { version = "1.0", features = ["derive", "std"] }
+tokio-cron-scheduler = "*"
+cron = "0.15.0"
